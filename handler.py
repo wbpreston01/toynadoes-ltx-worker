@@ -159,6 +159,8 @@ def handler(job):
     steps = int(job_input.get("steps", 50) or 50)
     guidance = float(job_input.get("cfg", 5.0) or 5.0)
     seed = int(job_input.get("seed", 0) or 0)
+    # Only the "Max" quality tier asks for the 4K upscale pass.
+    want_4k = bool(job_input.get("upscale_4k", False))
 
     try:
         import torch
