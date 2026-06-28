@@ -140,17 +140,21 @@ def _load():
 
 
 def _interpolate(src, dst, fps):
-    """Motion-interpolate a video up to `fps` with ffmpeg minterpolate (mci) — the
-    fix for choppy low-fps clips (e.g. Wan's 16 fps). Returns True on success."""
+    """Polish a clip: motion-interpolate to `fps` (fixes Wan's choppy 16 fps),
+    then crisp it up — 1.5x Lanczos upscale for more apparent resolution, a light
+    unsharp for clarity, and a small saturation/contrast lift for punchier color —
+    encoded at a low CRF (less compression mush). Returns True on success."""
     import subprocess
     vf = (
-        f"minterpolate=fps={int(fps)}:mi_mode=mci:mc_mode=aobmc:"
-        "me_mode=bidir:vsbmc=1"
+        f"minterpolate=fps={int(fps)}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+        "scale=iw*1.5:ih*1.5:flags=lanczos,"
+        "unsharp=5:5:0.7:5:5:0.0,"
+        "eq=saturation=1.08:contrast=1.05"
     )
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-i", src, "-vf", vf,
-             "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+             "-c:v", "libx264", "-crf", "15", "-preset", "medium",
              "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
