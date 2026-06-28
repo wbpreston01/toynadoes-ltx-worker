@@ -40,13 +40,47 @@ if os.path.isdir("/runpod-volume"):
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 
-def _round32(v, default):
+def _ltx_resolution(width, height):
+    """LTX-Video looks best at its native ~1216x704 (30fps) class of sizes, all
+    /32. We ignore the app's small incoming dims and snap to the LTX-native size
+    matching the requested aspect — low resolution is a top cause of the
+    'mutant' look, so we never render tiny."""
     try:
-        v = int(v)
+        w = int(width)
+        h = int(height)
     except Exception:
-        v = default
-    v = max(256, min(1280, v))
-    return (v // 32) * 32
+        w, h = 16, 9
+    if w > h:               # landscape (16:9)
+        return 1216, 704
+    if h > w:               # portrait (9:16)
+        return 704, 1216
+    return 768, 768         # square
+
+
+# LTX is trained on long, detailed, single-paragraph prompts. A one-line prompt
+# leaves the model free to hallucinate anatomy/texture (the 'nightmare doll'
+# failure). For short prompts we wrap the user's idea in a descriptive,
+# physically-grounded scaffold; detailed prompts are left alone.
+def _enrich_prompt(p):
+    p = p.strip().rstrip(".")
+    if len(p.split()) >= 30:
+        return p
+    return (
+        f"{p}. The scene is filmed as a real, physically plausible shot with "
+        "natural, correct anatomy and proportions and smooth, believable motion. "
+        "Soft cinematic lighting, shallow depth of field, a gentle slow camera "
+        "move, warm color grade, highly detailed realistic textures, sharp focus, "
+        "professional cinematography, coherent and stable throughout."
+    )
+
+
+# Strong default negative prompt aimed squarely at the body-horror artifacts.
+_NEG = (
+    "deformed, mutated, mutation, extra limbs, fused limbs, missing limbs, "
+    "distorted anatomy, malformed, disfigured, grotesque, body horror, melting, "
+    "warped face, two heads, uncanny, jittery, flickering, morphing, low quality, "
+    "worst quality, blurry, watermark, text, subtitles, duplicate"
+)
 
 
 def _round_frames(v, default=97):
@@ -84,15 +118,17 @@ def handler(job):
     if not prompt:
         return {"error": "No prompt provided (expected 'positive_prompt' or 'prompt')."}
 
-    negative_prompt = (
-        job_input.get("negative_prompt")
-        or "worst quality, blurry, distorted, deformed, watermark, text, subtitles"
-    )
-    width = _round32(job_input.get("width", 832), 832)
-    height = _round32(job_input.get("height", 480), 480)
+    prompt = _enrich_prompt(prompt)
+    # Always fold the strong anti-body-horror terms into any caller-supplied negative.
+    caller_neg = (job_input.get("negative_prompt") or "").strip()
+    negative_prompt = f"{caller_neg}, {_NEG}" if caller_neg else _NEG
+
+    width, height = _ltx_resolution(job_input.get("width", 1216), job_input.get("height", 704))
     num_frames = _round_frames(job_input.get("num_frames", 97))
-    steps = int(job_input.get("steps", 40) or 40)
-    guidance = float(job_input.get("cfg", 3.0) or 3.0)
+    # LTX (non-distilled) wants more steps and higher guidance than we first shipped;
+    # cfg ~5 sharply improves prompt adherence and kills hallucinated anatomy.
+    steps = int(job_input.get("steps", 50) or 50)
+    guidance = float(job_input.get("cfg", 5.0) or 5.0)
     seed = int(job_input.get("seed", 0) or 0)
 
     try:
@@ -114,7 +150,7 @@ def handler(job):
         frames = result.frames[0]
 
         out_path = os.path.join(tempfile.gettempdir(), f"ltx_{int(time.time()*1000)}.mp4")
-        export_to_video(frames, out_path, fps=24)
+        export_to_video(frames, out_path, fps=30)
 
         with open(out_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
