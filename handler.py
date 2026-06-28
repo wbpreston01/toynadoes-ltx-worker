@@ -139,9 +139,65 @@ def _load():
     return _pipe
 
 
+def _interpolate(src, dst, fps):
+    """Motion-interpolate a video up to `fps` with ffmpeg minterpolate (mci) — the
+    fix for choppy low-fps clips (e.g. Wan's 16 fps). Returns True on success."""
+    import subprocess
+    vf = (
+        f"minterpolate=fps={int(fps)}:mi_mode=mci:mc_mode=aobmc:"
+        "me_mode=bidir:vsbmc=1"
+    )
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-vf", vf,
+             "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+             "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return os.path.exists(dst) and os.path.getsize(dst) > 0
+    except Exception:
+        return False
+
+
+def _polish(job_input):
+    """POLISH MODE: when given `video_base64`, smooth it via frame interpolation
+    instead of generating. Lets the LTX endpoint double as our owned 'make-it-
+    smooth' service for clips from any model (e.g. Wan i2v at 16 fps)."""
+    b64 = job_input.get("video_base64")
+    if b64 and b64.startswith("data:"):
+        b64 = b64.split("base64,", 1)[-1]
+    if not b64:
+        return None  # not a polish request
+    target_fps = int(job_input.get("interpolate_fps", 32) or 32)
+    stamp = int(time.time() * 1000)
+    src = os.path.join(tempfile.gettempdir(), f"polish_{stamp}_in.mp4")
+    dst = os.path.join(tempfile.gettempdir(), f"polish_{stamp}_out.mp4")
+    try:
+        with open(src, "wb") as f:
+            f.write(base64.b64decode(b64))
+        ok = _interpolate(src, dst, target_fps)
+        final = dst if ok else src
+        with open(final, "rb") as f:
+            out_b64 = base64.b64encode(f.read()).decode("utf-8")
+        return {"video": f"data:video/mp4;base64,{out_b64}", "interpolated_fps": target_fps if ok else None}
+    except Exception as e:
+        return {"error": f"Polish/interpolation failed: {type(e).__name__}: {e}"}
+    finally:
+        for p in (src, dst):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
 def handler(job):
     started = time.time()
     job_input = job.get("input", {}) or {}
+
+    # Polish/interpolation request? Smooth the given clip and return (no LTX gen).
+    polished = _polish(job_input)
+    if polished is not None:
+        return polished
 
     prompt = (job_input.get("positive_prompt") or job_input.get("prompt") or "").strip()
     if not prompt:
