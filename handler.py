@@ -41,20 +41,20 @@ if os.path.isdir("/runpod-volume"):
 
 
 def _ltx_resolution(width, height):
-    """LTX-Video looks best at its native ~1216x704 (30fps) class of sizes, all
-    /32. We ignore the app's small incoming dims and snap to the LTX-native size
-    matching the requested aspect — low resolution is a top cause of the
-    'mutant' look, so we never render tiny."""
+    """LTX-Video can't render 4K natively (it works best under ~1280x720). We
+    GENERATE at LTX's max native size for the requested aspect, then upscale the
+    finished clip to 4K in a separate ffmpeg pass (_upscale_4k). Rendering tiny is
+    the top cause of the 'mutant' look, so we always render at the native ceiling."""
     try:
         w = int(width)
         h = int(height)
     except Exception:
         w, h = 16, 9
-    if w > h:               # landscape (16:9)
-        return 1216, 704
+    if w > h:               # landscape (16:9) — LTX native ceiling
+        return 1280, 704
     if h > w:               # portrait (9:16)
-        return 704, 1216
-    return 768, 768         # square
+        return 704, 1280
+    return 704, 704         # square
 
 
 # LTX is trained on long, detailed, single-paragraph prompts. A one-line prompt
@@ -81,6 +81,35 @@ _NEG = (
     "warped face, two heads, uncanny, jittery, flickering, morphing, low quality, "
     "worst quality, blurry, watermark, text, subtitles, duplicate"
 )
+
+
+def _upscale_4k(src, dst, width, height):
+    """Upscale the native LTX clip to 4K (UHD class) with a high-quality Lanczos
+    scale plus a mild sharpen, re-encoded H.264. LTX can't generate 4K directly,
+    so this is the real 'add 4K' step. Aspect is preserved (no stretch): the long
+    edge is taken to 3840 (landscape) / the tall edge to 3840 (portrait), square
+    to 2160x2160. Returns True on success, False to fall back to the native clip."""
+    import subprocess
+
+    if width > height:
+        scale = "scale=3840:-2:flags=lanczos"      # ~3840x2112, 4K width
+    elif height > width:
+        scale = "scale=-2:3840:flags=lanczos"      # ~2112x3840, 4K height
+    else:
+        scale = "scale=2160:2160:flags=lanczos"    # square UHD-class
+    vf = f"{scale},unsharp=5:5:0.8:5:5:0.0"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-vf", vf,
+             "-c:v", "libx264", "-crf", "16", "-preset", "medium",
+             "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return os.path.exists(dst) and os.path.getsize(dst) > 0
+    except Exception:
+        return False
 
 
 def _round_frames(v, default=97):
@@ -149,21 +178,40 @@ def handler(job):
         )
         frames = result.frames[0]
 
-        out_path = os.path.join(tempfile.gettempdir(), f"ltx_{int(time.time()*1000)}.mp4")
-        export_to_video(frames, out_path, fps=30)
+        stamp = int(time.time() * 1000)
+        native_path = os.path.join(tempfile.gettempdir(), f"ltx_{stamp}.mp4")
+        export_to_video(frames, native_path, fps=30)
 
-        with open(out_path, "rb") as f:
+        # 4K pass: upscale the native LTX clip to UHD-class. Falls back to the
+        # native clip if ffmpeg is unavailable or the scale fails.
+        uhd_path = os.path.join(tempfile.gettempdir(), f"ltx_{stamp}_4k.mp4")
+        final_path = native_path
+        out_w, out_h = width, height
+        if _upscale_4k(native_path, uhd_path, width, height):
+            final_path = uhd_path
+            if width > height:
+                out_w, out_h = 3840, round(3840 * height / width / 2) * 2
+            elif height > width:
+                out_w, out_h = round(3840 * width / height / 2) * 2, 3840
+            else:
+                out_w, out_h = 2160, 2160
+
+        with open(final_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
-        try:
-            os.remove(out_path)
-        except Exception:
-            pass
+        for p in (native_path, uhd_path):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
         return {
             "video": f"data:video/mp4;base64,{b64}",
             "seconds": round(time.time() - started, 1),
-            "width": width,
-            "height": height,
+            "width": out_w,
+            "height": out_h,
+            "render_width": width,
+            "render_height": height,
+            "upscaled_4k": final_path == uhd_path,
             "num_frames": num_frames,
         }
     except Exception as e:
